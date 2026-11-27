@@ -1,0 +1,120 @@
+# ============================================================
+# 小美赛（数学建模）项目 .gitignore
+# 原则：只提交代码、文档、小体积结果表；不提交原始数据、中间缓存、
+#       模型权重、二进制数组和环境/编辑器杂物。
+# ============================================================
+
+# ---------- 原始数据+赛题原件 ----------
+C_data/
+gitrepo/
+docs/
+
+# ---------- 任务一的生成产物：缓存与特征最占空间（约 10 GB）----------
+任务一/outputs/cache/
+任务一/outputs/features/
+任务一/outputs/metrics/partial/
+任务一/outputs_synth/
+任务一/outputs_probe/
+任务一/synth_data/
+
+# 说明：任务一/outputs/metrics/（少量 csv/json）与 outputs/figures/（png）
+#       体积很小，默认保留，便于在仓库里直接看结果。
+#       若不想提交任何生成结果，取消下面两行注释：
+# 任务一/outputs/
+# 任务一/outputs_synth/
+
+# ---------- 数值数组 / 模型权重 / 压缩包 ----------
+*.npz
+*.npy
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.rar
+
+# ---------- 缓存 ----------
+.mplcache/
+.matplotlib/
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# ---------- 虚拟环境 / 打包产物 ----------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+.eggs/
+
+# ---------- 日志、临时文件 ----------
+*.log
+logs/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*~
+~$*
+.~lock.*
+
+# ---------- 密钥 / 本地配置 ----------
+.env
+.env.*
+!.env.example
+*.local
+
+# ---------- 编辑器 / 操作系统 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*.code-workspace
+.DS_Store
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ---------- LaTeX 编译中间文件（写论文时用）----------
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.synctex(busy)
+*.toc
+*.lof
+*.lot
+*.out
+*.xdv
+
+# ----------  ----------
+

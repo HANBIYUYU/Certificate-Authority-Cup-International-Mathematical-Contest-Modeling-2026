@@ -109,16 +109,19 @@ def per_subject(
         m = pids == pid
         if m.sum() == 0:
             continue
+        # 只在"该受试者真实出现过的活动"上算宏平均，
+        # 否则缺席的类别会被记 0 分，冤枉那些只做了部分活动的人。
+        present = sorted(int(v) for v in np.unique(y_true[m]))
         rows.append(
             {
                 "pid": int(pid),
                 "n_windows": int(m.sum()),
                 "accuracy": float(accuracy_score(y_true[m], y_pred[m])),
                 "macro_f1": float(
-                    f1_score(y_true[m], y_pred[m], labels=list(labels),
+                    f1_score(y_true[m], y_pred[m], labels=present,
                              average="macro", zero_division=0)
                 ),
-                "n_true_classes": int(len(np.unique(y_true[m]))),
+                "n_classes_present": len(present),
             }
         )
     return pd.DataFrame(rows).sort_values("pid").reset_index(drop=True)
@@ -208,11 +211,16 @@ def df_to_markdown(df: pd.DataFrame, floatfmt: str = ".3f") -> str:
         cols = list(df.columns)
         lines = ["| " + " | ".join(map(str, cols)) + " |",
                  "| " + " | ".join(["---"] * len(cols)) + " |"]
-        for _, row in df.iterrows():
+        # 用 itertuples 逐列保留原始标量类型（iterrows 会把整行提升成 float）
+        for row in df[cols].itertuples(index=False, name=None):
             vals = []
-            for c in cols:
-                v = row[c]
-                vals.append(f"{v:{floatfmt}}" if isinstance(v, (float, np.floating)) else str(v))
+            for v in row:
+                if isinstance(v, (int, np.integer)) and not isinstance(v, bool):
+                    vals.append(str(int(v)))
+                elif isinstance(v, (float, np.floating)):
+                    vals.append(f"{float(v):{floatfmt}}")
+                else:
+                    vals.append(str(v))
             lines.append("| " + " | ".join(vals) + " |")
         return "\n".join(lines)
 

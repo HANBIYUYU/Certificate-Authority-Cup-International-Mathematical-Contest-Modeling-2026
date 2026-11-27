@@ -109,8 +109,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--learning-rate", type=float, default=0.08)
     p.add_argument("--folds-limit", type=int, default=0, help="只跑前几折（调试/计时用）")
     p.add_argument("--top-k", type=int, default=0, help="0 表示不做特征选择")
+    p.add_argument("--window-stride", type=int, default=1,
+                   help="训练时对窗口等距抽样的步幅，2=只用一半窗口（省内存，等价把重叠降为 0）")
 
     p.add_argument("--limit", type=int, default=0, help="只跑前 N 个受试者（调试用）")
+    p.add_argument("--resume", action="store_true", help="复用 metrics/partial 里已跑完的折")
+    p.add_argument("--fold-only", type=int, default=0,
+                   help="只跑第 N 折（1 起）。配合分进程运行，任何一折崩了只补那一折")
     p.add_argument("--no-cache", action="store_true", help="不缓存解析后的原始信号")
     p.add_argument("--force", action="store_true", help="重算已存在的特征文件")
     return p
@@ -242,52 +247,63 @@ def cmd_prepare(cfg: argparse.Namespace) -> Path:
 # --------------------------------------------------------------------------- #
 # 阶段 2：训练 + 评估
 # --------------------------------------------------------------------------- #
-def load_features(out: Path, limit: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """载入所有特征。先按 prepare_summary 预分配，避免 vstack 造成的双倍内存峰值。"""
+def _feature_files(out: Path, limit: int = 0) -> list[Path]:
     files = sorted((out / "features").glob("P*.npz"))
-    if limit:
-        files = files[:limit]
-    if not files:
-        raise FileNotFoundError("没有特征文件，请先运行 --stage prepare")
+    return files[:limit] if limit else files
 
-    total = None
-    summary = out / "prepare_summary.csv"
-    if summary.exists():
-        df = pd.read_csv(summary)
-        if limit:
-            df = df.head(limit)
-        total = int(df["windows"].sum())
 
-    if total and total > 0:
-        with np.load(files[0]) as z0:
-            n_feat = z0["F"].shape[1]
-        F = np.empty((total, n_feat), dtype=np.float32)
-        y = np.empty(total, dtype=np.int16)
-        pids = np.empty(total, dtype=np.int32)
-        off = 0
-        for f in files:
-            with np.load(f) as z:
-                n = z["F"].shape[0]
-                if off + n > total:          # summary 与实际不一致时兜底
-                    total = off + n
-                    F2 = np.empty((total, n_feat), dtype=np.float32)
-                    F2[:off] = F[:off]
-                    F = F2
-                    y2 = np.empty(total, dtype=np.int16); y2[:off] = y[:off]; y = y2
-                    p2 = np.empty(total, dtype=np.int32); p2[:off] = pids[:off]; pids = p2
-                F[off:off + n] = z["F"]
-                y[off:off + n] = z["y"]
-                pids[off:off + n] = z["pids"]
-                off += n
-        return F[:off], y[:off], pids[:off]
+def _pid_of(path: Path) -> int:
+    return int(path.stem.lstrip("Pp"))
 
-    Fs, ys, ps = [], [], []
-    for f in files:
+
+def load_meta(out: Path, limit: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """只读取标签与受试者编号（很小），用于划折。"""
+    ys, ps = [], []
+    for f in _feature_files(out, limit):
         with np.load(f) as z:
-            Fs.append(z["F"])
             ys.append(z["y"])
             ps.append(z["pids"])
-    return np.vstack(Fs), np.concatenate(ys), np.concatenate(ps)
+    if not ys:
+        raise FileNotFoundError("没有特征文件，请先运行 --stage prepare")
+    return np.concatenate(ys), np.concatenate(ps)
+
+
+def load_features(
+    out: Path, limit: int = 0, pids_keep: set[int] | None = None, stride: int = 1
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """按需加载特征。
+
+    内存吃紧时只加载某一折需要的受试者（`pids_keep`），避免全量矩阵常驻；
+    `stride>1` 再对窗口等距抽样，进一步降低训练内存（等价于把重叠率降为 0）。
+    先扫一遍行数再一次性分配，避免 vstack 的双倍峰值。
+    """
+    files = _feature_files(out, limit)
+    if pids_keep is not None:
+        files = [f for f in files if _pid_of(f) in pids_keep]
+    if not files:
+        raise FileNotFoundError("这一折没有对应的特征文件")
+    stride = max(1, int(stride))
+
+    total = 0
+    for f in files:
+        with np.load(f) as z:
+            total += len(range(0, int(z["y"].shape[0]), stride))
+    with np.load(files[0]) as z0:
+        n_feat = int(z0["F"].shape[1])
+
+    F = np.empty((total, n_feat), dtype=np.float32)
+    y = np.empty(total, dtype=np.int16)
+    pids = np.empty(total, dtype=np.int32)
+    off = 0
+    for f in files:
+        with np.load(f) as z:
+            Ff = z["F"][::stride]
+            n = int(Ff.shape[0])
+            F[off:off + n] = Ff
+            y[off:off + n] = z["y"][::stride]
+            pids[off:off + n] = z["pids"][::stride]
+            off += n
+    return F, y, pids
 
 
 def calibrate_reject_threshold(
@@ -342,26 +358,70 @@ def cmd_train(cfg: argparse.Namespace) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
 
     t_start = time.time()
-    F, y, pids = load_features(out, cfg.limit)
-    log(f"载入特征 {F.shape}，受试者 {len(np.unique(pids))} 人，类别 {sorted(np.unique(y))}")
+    y, pids = load_meta(out, cfg.limit)
+    with np.load(_feature_files(out, cfg.limit)[0]) as z0:
+        n_feat = int(z0["F"].shape[1])
+    log(f"共 {len(y)} 个窗口 × {n_feat} 维；受试者 {len(np.unique(pids))} 人，"
+        f"类别 {sorted(int(v) for v in np.unique(y))}")
 
     labels = sorted(int(v) for v in np.unique(y))
     folds = S.group_kfold(pids, cfg.n_splits, cfg.seed)
     if cfg.folds_limit:
         folds = folds[: cfg.folds_limit]
-    log(f"按受试者 {cfg.n_splits} 折交叉验证；模型 {cfg.model}；本次跑 {len(folds)} 折")
+    if cfg.fold_only and not (1 <= cfg.fold_only <= len(folds)):
+        raise ValueError(f"--fold-only 必须在 1..{len(folds)} 之间")
+    log(f"按受试者 {cfg.n_splits} 折交叉验证；模型 {cfg.model}")
+    log("按折加载特征（不常驻全量矩阵，避免内存峰值）")
 
-    y_true_all: list[np.ndarray] = []
-    y_pred_all: list[np.ndarray] = []
-    pids_all: list[np.ndarray] = []
-    fold_rows: list[dict] = []
+    partial_dir = met_dir / "partial"
+    partial_dir.mkdir(parents=True, exist_ok=True)
 
-    for fi, (train_pids, test_pids) in enumerate(folds, 1):
+    # 配置指纹：只允许把"同一次实验"的分折结果合并到一起
+    manifest = {
+        "n_splits": len(folds), "seed": cfg.seed, "model": cfg.model,
+        "max_iter": cfg.max_iter, "learning_rate": cfg.learning_rate,
+        "window_stride": cfg.window_stride, "top_k": cfg.top_k,
+        "others_mode": cfg.others_mode, "feature_dim": n_feat,
+    }
+    man_p = partial_dir / "manifest.json"
+    if man_p.exists():
+        try:
+            old = json.loads(man_p.read_text(encoding="utf-8"))
+        except Exception:
+            old = None
+        if old != manifest:
+            log("[警告] partial/ 里是别的配置留下的结果，已清理，避免混用")
+            for p in partial_dir.glob("fold_*"):
+                p.unlink()
+    man_p.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    # 收集已经跑完的折——这是"只跑剩下的"的关键
+    collected: dict[int, tuple] = {}
+    for fi in range(1, len(folds) + 1):
+        npz_p = partial_dir / f"fold_{fi:02d}.npz"
+        json_p = partial_dir / f"fold_{fi:02d}.json"
+        if npz_p.exists() and json_p.exists():
+            with np.load(npz_p) as z:
+                collected[fi] = (
+                    z["yte"], z["pred"], z["pte"],
+                    json.loads(json_p.read_text(encoding="utf-8")),
+                )
+
+    selected = [cfg.fold_only] if cfg.fold_only else list(range(1, len(folds) + 1))
+    todo = [fi for fi in selected if fi not in collected]
+    log(f"{len(folds)} 折：已有 {sorted(collected) or '无'}，本次跑 {todo or '无'}")
+
+    for fi in todo:
+        train_pids, test_pids = folds[fi - 1]
         t0 = time.time()
-        m_tr = S.subset_by_pids(pids, train_pids)
-        m_te = S.subset_by_pids(pids, test_pids)
-        Xtr, ytr = F[m_tr], y[m_tr]
-        Xte, yte = F[m_te], y[m_te]
+        tag = f"fold_{fi:02d}"
+        npz_p = partial_dir / f"{tag}.npz"
+        json_p = partial_dir / f"{tag}.json"
+
+        keep_tr = {int(p) for p in train_pids}
+        keep_te = {int(p) for p in test_pids}
+        Xtr, ytr, ptr = load_features(out, cfg.limit, keep_tr, cfg.window_stride)
+        Xte, yte, pte = load_features(out, cfg.limit, keep_te, cfg.window_stride)
 
         col_idx = None
         if cfg.top_k > 0:
@@ -374,7 +434,7 @@ def cmd_train(cfg: argparse.Namespace) -> None:
 
         tau = 0.0
         if cfg.others_mode == "reject":
-            tau = calibrate_reject_threshold(Xtr, ytr, pids[m_tr], cfg, labels)
+            tau = calibrate_reject_threshold(Xtr, ytr, ptr, cfg, labels)
 
         model = M.build_model(
             cfg.model, cfg.seed, cfg.class_weight,
@@ -407,22 +467,21 @@ def cmd_train(cfg: argparse.Namespace) -> None:
 
         acc = accuracy_score(yte, pred)
         f1 = f1_score(yte, pred, labels=labels, average="macro", zero_division=0)
-        fold_rows.append(
-            {
-                "fold": fi,
-                "train_pids": " ".join(f"{p:02d}" for p in train_pids),
-                "test_pids": " ".join(f"{p:02d}" for p in test_pids),
-                "n_train": int(m_tr.sum()),
-                "n_test": int(m_te.sum()),
-                "accuracy": float(acc),
-                "macro_f1": float(f1),
-                "reject_tau": float(tau),
-                "elapsed_s": round(time.time() - t0, 1),
-            }
-        )
-        y_true_all.append(yte)
-        y_pred_all.append(pred)
-        pids_all.append(pids[m_te])
+        row = {
+            "fold": fi,
+            "train_pids": " ".join(f"{p:02d}" for p in train_pids),
+            "test_pids": " ".join(f"{p:02d}" for p in test_pids),
+            "n_train": int(len(ytr)),
+            "n_test": int(len(yte)),
+            "accuracy": float(acc),
+            "macro_f1": float(f1),
+            "reject_tau": float(tau),
+            "elapsed_s": round(time.time() - t0, 1),
+        }
+        collected[fi] = (yte, pred, pte, row)
+        # 落盘：万一后面某折崩了，可以 --resume 或 --fold-only 接着跑
+        np.savez(partial_dir / f"{tag}.npz", yte=yte, pred=pred, pte=pte)
+        json_p.write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
         log(
             f"fold {fi}/{len(folds)} 测试受试者 {list(map(int, test_pids))} "
             f"acc={acc:.4f} macroF1={f1:.4f} ({secs(time.time() - t0)})"
@@ -431,9 +490,15 @@ def cmd_train(cfg: argparse.Namespace) -> None:
         del model, Xtr, Xte, ytr, yte, proba, pred
         gc.collect()
 
-    y_true = np.concatenate(y_true_all)
-    y_pred = np.concatenate(y_pred_all)
-    pids_oof = np.concatenate(pids_all)
+    if not collected:
+        raise RuntimeError("没有任何一折可用（既没有历史结果，本次也没有成功跑出结果）")
+    order = sorted(collected)
+    y_true = np.concatenate([collected[i][0] for i in order])
+    y_pred = np.concatenate([collected[i][1] for i in order])
+    pids_oof = np.concatenate([collected[i][2] for i in order])
+    fold_rows = [collected[i][3] for i in order]
+    if len(order) < len(folds):
+        log(f"[注意] 本次只合并了 {len(order)}/{len(folds)} 折，报告里会标注")
 
     metrics = E.compute_metrics(y_true, y_pred, labels)
     sub_df = E.per_subject(y_true, y_pred, pids_oof, labels)
@@ -457,7 +522,7 @@ def cmd_train(cfg: argparse.Namespace) -> None:
     head["per_subject_accuracy_min"] = float(sub_df["accuracy"].min())
     head["per_subject_accuracy_max"] = float(sub_df["accuracy"].max())
     head["config"] = cfg_to_dict(cfg)
-    head["feature_dim"] = int(F.shape[1])
+    head["feature_dim"] = int(n_feat)
     head["elapsed_s"] = round(time.time() - t_start, 1)
     E.save_json(head, met_dir / "results.json")
 
@@ -470,7 +535,7 @@ def cmd_train(cfg: argparse.Namespace) -> None:
     summary_csv = out / "prepare_summary.csv"
     data_df = pd.read_csv(summary_csv) if summary_csv.exists() else None
     label_counts = pd.Series(y).value_counts().sort_index()
-    write_report(out, cfg, metrics, sub_df, fold_rows, F.shape, data_df, label_counts)
+    write_report(out, cfg, metrics, sub_df, fold_rows, (int(len(y)), n_feat), data_df, label_counts)
     log(f"总体 acc={metrics['accuracy']:.4f}  macroF1={metrics['macro_f1']:.4f}  "
         f"balanced={metrics['balanced_accuracy']:.4f}")
     log(f"结果已写入 {out}")
@@ -674,6 +739,8 @@ def write_report(
         f"- 模型：{cfg.model}，类别权重 `{cfg.class_weight}`",
         f"- Others 处理：`{cfg.others_mode}`",
         f"- 窗口样本量：{shape[0]}",
+        f"- 实际合并折数：{len(folds)} / {cfg.n_splits}",
+        "  （如少于总折数，说明有折尚未跑完；指标只覆盖已完成的折）",
         "",
         "**如何处理时间维与活动切换**",
         "",
@@ -733,7 +800,7 @@ def write_report(
         "![跨受试者](figures/per_subject.png)",
         "",
         E.df_to_markdown(
-            sub_df[["pid", "n_windows", "accuracy", "macro_f1", "n_true_classes"]]
+            sub_df[["pid", "n_windows", "accuracy", "macro_f1", "n_classes_present"]]
         ),
         "",
         "## 7. 各折结果",
@@ -785,23 +852,57 @@ def load_saved_metrics(out: Path):
     return metrics, sub, folds, results
 
 
+def _load_partial_predictions(pdir: Path):
+    """把各折的逐样本预测拼起来（按折号排序）。"""
+    if not pdir.exists():
+        return None
+    files = sorted(pdir.glob("fold_*.npz"))
+    if not files:
+        return None
+    ys, ps, ids = [], [], []
+    for f in files:
+        with np.load(f) as z:
+            ys.append(z["yte"])
+            ps.append(z["pred"])
+            ids.append(z["pte"])
+    return np.concatenate(ys), np.concatenate(ps), np.concatenate(ids)
+
+
 def cmd_report(cfg: argparse.Namespace) -> None:
     out = Path(cfg.out_dir)
-    metrics, sub, folds, results = load_saved_metrics(out)
+    met = out / "metrics"
+    results = json.loads((met / "results.json").read_text(encoding="utf-8"))
 
     # 用当初那次运行的配置覆盖命令行默认值，保证报告里的参数与结果一致
     for k, v in (results.get("config") or {}).items():
         if hasattr(cfg, k):
             setattr(cfg, k, v)
 
+    labels = [int(x) for x in results["labels"]]
+    preds = _load_partial_predictions(met / "partial")
+    if preds is not None:
+        y_true, y_pred, pids = preds
+        metrics = E.compute_metrics(y_true, y_pred, labels)
+        sub = E.per_subject(y_true, y_pred, pids, labels)
+        # 顺手把逐类 / 逐人 / 混淆矩阵也按同一次口径重写一遍
+        metrics["per_class"].to_csv(met / "per_class.csv", index=False, encoding="utf-8-sig")
+        sub.to_csv(met / "per_subject.csv", index=False, encoding="utf-8-sig")
+        np.savetxt(met / "confusion_matrix.csv", metrics["confusion"], fmt="%d", delimiter=",")
+        if not metrics["confusions"].empty:
+            metrics["confusions"].to_csv(met / "confusions.csv", index=False, encoding="utf-8-sig")
+        log(f"由 {len(list((met / 'partial').glob('fold_*.npz')))} 折的逐样本预测重算了指标")
+    else:
+        metrics, sub, _, _ = load_saved_metrics(out)
+
     summary_csv = out / "prepare_summary.csv"
     data_df = pd.read_csv(summary_csv) if summary_csv.exists() else None
     per = metrics["per_class"]
     label_counts = pd.Series(per["support"].to_numpy(), index=per["label"].to_numpy())
+    folds = pd.read_csv(met / "per_fold.csv").to_dict("records")
     shape = (int(results["n_samples"]), int(results["feature_dim"]))
 
     write_report(out, cfg, metrics, sub, folds, shape, data_df, label_counts)
-    log(f"已根据 {out / 'metrics'} 重建 REPORT.md")
+    log(f"已重建 {out / 'REPORT.md'}")
 
 
 # --------------------------------------------------------------------------- #
